@@ -34,6 +34,10 @@ def get_engine():
     # Normalize old 'postgres://' scheme to 'postgresql://'
     if db_url.startswith("postgres://"):
         db_url = "postgresql://" + db_url[len("postgres://"):]
+    # Use psycopg2 explicitly (newer SQLAlchemy defaults to psycopg v3,
+    # which is not in requirements.txt)
+    if db_url.startswith("postgresql://"):
+        db_url = "postgresql+psycopg2://" + db_url[len("postgresql://"):]
     _engine = create_engine(db_url, pool_pre_ping=True)
     return _engine
 
