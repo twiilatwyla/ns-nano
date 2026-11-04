@@ -91,8 +91,16 @@ meta AS (
 )
 """
 
-# Study IDs that mention a term
-TERM_SET = "SELECT DISTINCT study_id FROM ns.annotations_terms WHERE term = :{p}"
+# Study IDs that mention a term.
+# In the DB, terms may be stored with the Neurosynth prefix
+# (e.g. 'terms_abstract_tfidf__amygdala'), so match both forms.
+TERM_PREFIX = "terms_abstract_tfidf__"
+TERM_SET = ("SELECT DISTINCT study_id FROM ns.annotations_terms "
+            "WHERE term IN (:{p}, :{p}_full)")
+
+
+def term_params(name: str, term: str) -> dict:
+    return {name: term, f"{name}_full": TERM_PREFIX + term}
 
 # Study IDs that report a coordinate (within radius mm)
 LOC_SET = """
@@ -199,7 +207,7 @@ def create_app():
     @app.get("/terms/<path:term>/studies", endpoint="terms_studies")
     def get_studies_by_term(term):
         t = normalize_term(term)
-        studies = run_single(TERM_SET.format(p="t"), {"t": t})
+        studies = run_single(TERM_SET.format(p="t"), term_params("t", t))
         return jsonify({"term": t, "count": len(studies), "studies": studies})
 
     @app.get("/locations/<coords>/studies", endpoint="locations_studies")
@@ -215,7 +223,7 @@ def create_app():
     @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
     def dissociate_terms(term_a, term_b):
         a, b = normalize_term(term_a), normalize_term(term_b)
-        params = {"ta": a, "tb": b}
+        params = {**term_params("ta", a), **term_params("tb", b)}
         set_a, set_b = TERM_SET.format(p="ta"), TERM_SET.format(p="tb")
 
         a_minus_b = pack(a, b, run_query(set_a, set_b, params))
