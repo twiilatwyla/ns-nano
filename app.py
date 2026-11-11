@@ -1,447 +1,1113 @@
-# app.py
-# Neurosynth functional-dissociation backend (Flask)
-# Based on https://github.com/spiketren/ns-nano
-#
-# Endpoints
-#   GET /                                         health check + usage
-#   GET /img                                      sample image
-#   GET /test_db                                  DB connectivity test
-#   GET /terms/<term>/studies                     studies mentioning <term>
-#   GET /locations/<x_y_z>/studies                studies reporting [x, y, z]
-#   GET /dissociate/terms/<term_a>/<term_b>       studies with term_a but NOT term_b
-#   GET /dissociate/locations/<x1_y1_z1>/<x2_y2_z2>
-#                                                 studies with [x1,y1,z1] but NOT [x2,y2,z2]
-#
-# Optional query parameters
-#   ?both=1      also return the reverse direction (B \ A) in the same response
-#   ?radius=R    (locations only) match coordinates within R mm (default 0 = exact match)
+"""
+LoTUS-BF backend (Flask)
+Location-or-Term Unified Search for Brain Functions
 
+Endpoints (blueprint):
+  GET /help                                  usage
+  GET /terms                                 all terms
+  GET /terms/<term>                          related terms (co-occurrence, Jaccard)
+  GET /query/<mixed>/studies                 studies matching a mixed query
+  GET /query/<mixed>/locations               peak coordinates of those studies
+  GET /query/<mixed>/nii                     meta-analytic NIfTI map
+  GET /lotus-bf/                             the built React frontend (if dist/ exists)
+
+Configuration (environment variables):
+  DB_URL or DATABASE_URL   PostgreSQL connection string (required)
+  LOTUS_DIST               folder holding the built frontend (default: ./dist)
+
+The backend adapts to the database schema it finds:
+  * terms come from ns.annotations_json (jsonb) or ns.annotations_terms (long format)
+  * term search uses the term annotations when present, otherwise metadata.fts
+"""
 import os
-from flask import Flask, jsonify, request, send_file
+import re
+import time
+import urllib.parse
+from typing import List, Tuple, Dict, Any, Optional
+
+from flask import Blueprint, Flask, jsonify, request, send_file, send_from_directory, abort
 from sqlalchemy import create_engine, text
 
-SRID = 4326
+# ------------ DB engine -------------
 _engine = None
 
 
+def _normalize_query(expr: str) -> str:
+    if not expr:
+        return expr
+    expr = re.sub(r'(?i)\b(NOT|AND|OR)(?=[^\s()])', r'\1 ', expr)
+    expr = re.sub(r'%(?![0-9A-Fa-f]{2})', ' ', expr)
+    expr = re.sub(r'\s+', ' ', expr).strip()
+    return expr
+
+
 def get_engine():
+    """Create (once) the SQLAlchemy engine from DB_URL / DATABASE_URL.
+    Credentials are no longer hard-coded in the source."""
     global _engine
     if _engine is not None:
         return _engine
     db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("Missing DB_URL (or DATABASE_URL) environment variable.")
-    # Normalize old 'postgres://' scheme to 'postgresql://'
     if db_url.startswith("postgres://"):
         db_url = "postgresql://" + db_url[len("postgres://"):]
-    # Use psycopg2 explicitly (newer SQLAlchemy defaults to psycopg v3,
-    # which is not in requirements.txt)
     if db_url.startswith("postgresql://"):
         db_url = "postgresql+psycopg2://" + db_url[len("postgresql://"):]
-    _engine = create_engine(db_url, pool_pre_ping=True)
+    _engine = create_engine(db_url, pool_pre_ping=True, pool_recycle=300, future=True)
     return _engine
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-class BadRequest(ValueError):
-    pass
+# ------------ Schema detection (cached) -------------
+_SCHEMA: Optional[Dict[str, Any]] = None
 
 
-def normalize_term(term: str) -> str:
-    """'posterior_cingulate' / 'Posterior Cingulate' -> 'posterior cingulate'"""
-    t = " ".join(term.replace("_", " ").split()).lower()
-    if not t:
-        raise BadRequest("Empty term.")
-    return t
-
-
-def parse_coords(coords: str):
-    """'0_-52_26' -> (0.0, -52.0, 26.0)"""
-    parts = coords.replace(",", "_").split("_")
-    if len(parts) != 3:
-        raise BadRequest(f"Coordinates must be x_y_z, got '{coords}'.")
+def get_schema(conn) -> Dict[str, Any]:
+    """Detect which tables/columns exist so one backend works with
+    both the course database and the ns-nano (W08) database."""
+    global _SCHEMA
+    if _SCHEMA is not None:
+        return _SCHEMA
+    tables = {r[0] for r in conn.execute(text(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'ns'"))}
+    meta_cols = {r[0] for r in conn.execute(text(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'ns' AND table_name = 'metadata'"))}
+    srid = 0
     try:
-        return tuple(float(p) for p in parts)
-    except ValueError:
-        raise BadRequest(f"Coordinates must be numbers, got '{coords}'.")
-
-
-def get_radius() -> float:
-    try:
-        r = float(request.args.get("radius", 0))
-    except ValueError:
-        raise BadRequest("radius must be a number.")
-    if r < 0:
-        raise BadRequest("radius must be >= 0.")
-    return r
-
-
-def want_both() -> bool:
-    return request.args.get("both", "").lower() in ("1", "true", "yes")
-
-
-# Study metadata (one row per study_id)
-META_CTE = """
-meta AS (
-    SELECT DISTINCT ON (study_id) study_id, title, authors, journal, year
-    FROM ns.metadata
-    ORDER BY study_id
-)
-"""
-
-# Study IDs that mention a term.
-# In the DB, terms may be stored with the Neurosynth prefix
-# (e.g. 'terms_abstract_tfidf__amygdala'), so match both forms.
-TERM_PREFIX = "terms_abstract_tfidf__"
-TERM_SET = ("SELECT DISTINCT study_id FROM ns.annotations_terms "
-            "WHERE term IN (:{p}, :{p}_full)")
-
-
-def term_params(name: str, term: str) -> dict:
-    return {name: term, f"{name}_full": TERM_PREFIX + term}
-
-# Study IDs that report a coordinate (within radius mm)
-LOC_SET = """
-SELECT DISTINCT study_id FROM ns.coordinates
-WHERE ST_3DDWithin(
-    geom,
-    ST_SetSRID(ST_MakePoint(:{p}x, :{p}y, :{p}z), {srid}),
-    :radius
-)
-"""
-
-
-def run_query(set_a_sql: str, set_b_sql: str, params: dict):
-    """Return studies in set A but not in set B (A \\ B), with metadata.
-    The set difference is done inside PostgreSQL with EXCEPT."""
-    sql = f"""
-    WITH diff AS (
-        ({set_a_sql})
-        EXCEPT
-        ({set_b_sql})
-    ),
-    {META_CTE}
-    SELECT d.study_id, m.title, m.authors, m.journal, m.year
-    FROM diff d
-    LEFT JOIN meta m USING (study_id)
-    ORDER BY m.year DESC NULLS LAST, d.study_id
-    """
-    with get_engine().begin() as conn:
-        rows = conn.execute(text(sql), params).mappings().all()
-    return [dict(r) for r in rows]
-
-
-def run_single(set_sql: str, params: dict):
-    sql = f"""
-    WITH a AS ({set_sql}),
-         {META_CTE}
-    SELECT a.study_id, m.title, m.authors, m.journal, m.year
-    FROM a
-    LEFT JOIN meta m USING (study_id)
-    ORDER BY m.year DESC NULLS LAST, a.study_id
-    """
-    with get_engine().begin() as conn:
-        rows = conn.execute(text(sql), params).mappings().all()
-    return [dict(r) for r in rows]
-
-
-def pack(a, b, studies):
-    return {
-        "a": a,
-        "b": b,
-        "description": f"Studies that mention {a} but NOT {b}",
-        "count": len(studies),
-        "studies": studies,
+        srid = conn.execute(text("SELECT ST_SRID(geom) FROM ns.coordinates LIMIT 1")).scalar() or 0
+    except Exception:
+        pass
+    _SCHEMA = {
+        "annotations_json": "annotations_json" in tables,
+        "annotations_terms": "annotations_terms" in tables,
+        "fts": "fts" in meta_cols,
+        "meta_cols": sorted(meta_cols),
+        "srid": int(srid),
     }
+    return _SCHEMA
 
 
-# -----------------------------
-# Interactive page (/app): type terms or coordinates, see the results
-# -----------------------------
-UI_HTML = r"""<!doctype html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Neurosynth Dissociation</title>
-<style>
-  :root { --bg:#f7f7f5; --card:#fff; --text:#1f2328; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; --accent2:#7c3aed; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text);
-         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif; }
-  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
-  h1 { font-size: 1.5rem; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  .tabs { display:flex; gap:8px; margin-bottom: 12px; }
-  .tab { border:1px solid var(--line); background:#fff; padding:8px 14px; border-radius:999px; cursor:pointer; font-size:.95rem; }
-  .tab.on { background: var(--text); color:#fff; border-color: var(--text); }
-  .row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  label { display:block; font-size:.85rem; color: var(--muted); margin-bottom: 4px; }
-  input[type=text], input[type=number] { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; font-size:1rem; }
-  .opts { display:flex; flex-wrap:wrap; gap:16px; align-items:center; margin-top:12px; font-size:.95rem; }
-  .opts input[type=number] { width: 90px; }
-  button.go { margin-top: 14px; background: var(--accent); color:#fff; border:0; padding:10px 18px; border-radius:8px; font-size:1rem; cursor:pointer; }
-  button.go:disabled { opacity:.6; cursor:wait; }
-  .examples { margin-top: 10px; font-size:.85rem; color: var(--muted); }
-  .examples a { color: var(--accent); cursor:pointer; margin-right: 10px; }
-  .summary { display:flex; flex-wrap:wrap; gap:12px; margin-bottom: 12px; }
-  .stat { flex:1 1 200px; border-left: 4px solid var(--accent); padding: 6px 12px; background: #f3f6ff; border-radius: 6px; }
-  .stat.b { border-color: var(--accent2); background: #f6f2ff; }
-  .stat .n { font-size: 1.6rem; font-weight: 700; }
-  .stat .d { font-size: .85rem; color: var(--muted); }
-  table { width:100%; border-collapse: collapse; font-size: .9rem; }
-  th, td { text-align:left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--muted); font-weight: 600; }
-  th:first-child, td.y { width: 64px; white-space: nowrap; color: var(--muted); }
-  .err { color: #b91c1c; }
-  .muted { color: var(--muted); font-size: .85rem; }
-  h3 { margin: 18px 0 8px; font-size: 1.05rem; }
-  @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
-</style>
-</head>
-<body>
-<main>
-  <h1>Neurosynth Functional Dissociation</h1>
-  <p class="sub">輸入兩個腦區詞彙或 MNI 座標，找出「提到 A 但沒提到 B」的研究。</p>
+# ------------ Helpers -------------
 
-  <div class="card">
-    <div class="tabs">
-      <button class="tab on" data-mode="terms">用詞彙 Terms</button>
-      <button class="tab" data-mode="locations">用座標 Locations</button>
-    </div>
+PREFIX = "terms_abstract_tfidf__"
+BOOL_WORDS = {"AND", "OR", "NOT"}
 
-    <div class="row">
-      <div><label id="la">詞彙 A</label><input type="text" id="a"></div>
-      <div><label id="lb">詞彙 B</label><input type="text" id="b"></div>
-    </div>
-
-    <div class="opts">
-      <label style="margin:0"><input type="checkbox" id="both" checked> 同時顯示反方向（B 但不是 A）</label>
-      <span id="radiusBox" style="display:none">半徑 <input type="number" id="radius" value="0" min="0" step="1"> mm</span>
-    </div>
-
-    <button class="go" id="go">查詢</button>
-    <div class="examples" id="examples"></div>
-  </div>
-
-  <div id="out"></div>
-  <p class="muted">API：<code id="apiUrl"></code></p>
-</main>
-
-<script>
-const EX = {
-  terms: [["posterior cingulate", "ventromedial prefrontal"], ["amygdala", "hippocampus"]],
-  locations: [["0_-52_26", "-2_50_-6"], ["-22_0_-20", "22_0_-20"]]
-};
-let mode = "terms";
-const $ = id => document.getElementById(id);
-
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-}
-
-function setMode(m) {
-  mode = m;
-  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.dataset.mode === m));
-  $("la").textContent = m === "terms" ? "詞彙 A" : "座標 A（x_y_z）";
-  $("lb").textContent = m === "terms" ? "詞彙 B" : "座標 B（x_y_z）";
-  $("radiusBox").style.display = m === "locations" ? "" : "none";
-  $("a").value = EX[m][0][0]; $("b").value = EX[m][0][1];
-  $("examples").innerHTML = "範例：" + EX[m].map((p, i) =>
-    `<a data-i="${i}">${esc(p[0])} vs ${esc(p[1])}</a>`).join("");
-  $("examples").querySelectorAll("a").forEach(el => el.onclick = () => {
-    const p = EX[mode][el.dataset.i]; $("a").value = p[0]; $("b").value = p[1]; run();
-  });
-}
-
-function table(studies) {
-  if (!studies.length) return '<p class="muted">沒有符合的研究。</p>';
-  const rows = studies.slice(0, 200).map(s => `
-    <tr>
-      <td class="y">${esc(s.year ?? "")}</td>
-      <td><a href="https://pubmed.ncbi.nlm.nih.gov/${encodeURIComponent(s.study_id)}/" target="_blank" rel="noopener">${esc(s.title || s.study_id)}</a>
-          <div class="muted">${esc(s.authors || "")}${s.journal ? " · " + esc(s.journal) : ""}</div></td>
-    </tr>`).join("");
-  const more = studies.length > 200 ? `<p class="muted">只顯示前 200 筆（共 ${studies.length} 筆）。</p>` : "";
-  return `<table><thead><tr><th>年份</th><th>研究</th></tr></thead><tbody>${rows}</tbody></table>${more}`;
-}
-
-async function run() {
-  const a = $("a").value.trim(), b = $("b").value.trim();
-  if (!a || !b) { $("out").innerHTML = '<div class="card err">請輸入 A 和 B。</div>'; return; }
-  const enc = s => encodeURIComponent(mode === "terms" ? s.replace(/\s+/g, "_") : s.replace(/[,\s]+/g, "_"));
-  const q = new URLSearchParams();
-  if ($("both").checked) q.set("both", "1");
-  if (mode === "locations" && Number($("radius").value) > 0) q.set("radius", $("radius").value);
-  const url = `/dissociate/${mode}/${enc(a)}/${enc(b)}` + (q.toString() ? "?" + q : "");
-  $("apiUrl").textContent = url;
-  $("go").disabled = true;
-  $("out").innerHTML = '<div class="card muted">查詢中…（伺服器休眠時第一次可能要等快一分鐘）</div>';
-  try {
-    const r = await fetch(url);
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || r.status);
-    const ab = d.a_minus_b || d, ba = d.b_minus_a;
-    const name = x => Array.isArray(x) ? "[" + x.join(", ") + "]" : x;
-    let html = '<div class="card"><div class="summary">' +
-      `<div class="stat"><div class="n">${ab.count}</div><div class="d">提到 <b>${esc(name(ab.a))}</b> 但沒提到 <b>${esc(name(ab.b))}</b></div></div>` +
-      (ba ? `<div class="stat b"><div class="n">${ba.count}</div><div class="d">提到 <b>${esc(name(ba.a))}</b> 但沒提到 <b>${esc(name(ba.b))}</b></div></div>` : "") +
-      "</div>" +
-      `<h3>${esc(name(ab.a))} \\ ${esc(name(ab.b))}</h3>` + table(ab.studies) +
-      (ba ? `<h3>${esc(name(ba.a))} \\ ${esc(name(ba.b))}</h3>` + table(ba.studies) : "") +
-      "</div>";
-    $("out").innerHTML = html;
-  } catch (e) {
-    $("out").innerHTML = `<div class="card err">查詢失敗：${esc(e.message)}</div>`;
-  } finally {
-    $("go").disabled = false;
-  }
-}
-
-document.querySelectorAll(".tab").forEach(t => t.onclick = () => setMode(t.dataset.mode));
-$("go").onclick = run;
-["a", "b"].forEach(id => $(id).addEventListener("keydown", e => { if (e.key === "Enter") run(); }));
-setMode("terms");
-</script>
-</body>
-</html>
-"""
-
-
-# -----------------------------
-# App
-# -----------------------------
-def create_app():
-    app = Flask(__name__)
-    app.json.sort_keys = False
-
-    @app.after_request
-    def add_cors_headers(resp):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
-
-    @app.errorhandler(BadRequest)
-    def handle_bad_request(e):
-        return jsonify({"error": str(e)}), 400
-
-    @app.errorhandler(Exception)
-    def handle_error(e):
-        code = getattr(e, "code", 500)
-        if not isinstance(code, int):
-            code = 500
-        return jsonify({"error": str(e)}), code
-
-    @app.get("/", endpoint="health")
-    def health():
-        return """
-        <h2>Neurosynth Functional Dissociation API</h2>
-        <p>Server working!</p>
-        <p><a href="/app"><b>&rarr; Interactive search page (/app)</b></a></p>
-        <ul>
-          <li><a href="/dissociate/terms/posterior_cingulate/ventromedial_prefrontal">/dissociate/terms/posterior_cingulate/ventromedial_prefrontal</a></li>
-          <li><a href="/dissociate/terms/ventromedial_prefrontal/posterior_cingulate">/dissociate/terms/ventromedial_prefrontal/posterior_cingulate</a></li>
-          <li><a href="/dissociate/locations/0_-52_26/-2_50_-6">/dissociate/locations/0_-52_26/-2_50_-6</a></li>
-          <li><a href="/dissociate/locations/-2_50_-6/0_-52_26">/dissociate/locations/-2_50_-6/0_-52_26</a></li>
-          <li><a href="/dissociate/terms/posterior_cingulate/ventromedial_prefrontal?both=1">... ?both=1</a> (A\\B and B\\A in one response)</li>
-          <li><a href="/dissociate/locations/0_-52_26/-2_50_-6?radius=6">... ?radius=6</a> (coordinates within 6 mm)</li>
-          <li>Sanity check (amygdala, [-22,0,-20]):
-              <a href="/terms/amygdala/studies">/terms/amygdala/studies</a> ·
-              <a href="/locations/-22_0_-20/studies?radius=6">/locations/-22_0_-20/studies?radius=6</a></li>
-          <li><a href="/test_db">/test_db</a> · <a href="/img">/img</a></li>
-        </ul>
-        """
-
-    @app.get("/app", endpoint="ui")
-    def ui():
-        return UI_HTML
-
-    @app.get("/img", endpoint="show_img")
-    def show_img():
-        return send_file("amygdala.gif", mimetype="image/gif")
-
-    # ---- single-set queries ----
-    @app.get("/terms/<path:term>/studies", endpoint="terms_studies")
-    def get_studies_by_term(term):
-        t = normalize_term(term)
-        studies = run_single(TERM_SET.format(p="t"), term_params("t", t))
-        return jsonify({"term": t, "count": len(studies), "studies": studies})
-
-    @app.get("/locations/<coords>/studies", endpoint="locations_studies")
-    def get_studies_by_coordinates(coords):
-        x, y, z = parse_coords(coords)
-        r = get_radius()
-        studies = run_single(LOC_SET.format(p="a", srid=SRID),
-                             {"ax": x, "ay": y, "az": z, "radius": r})
-        return jsonify({"location": [x, y, z], "radius_mm": r,
-                        "count": len(studies), "studies": studies})
-
-    # ---- dissociation: terms ----
-    @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
-    def dissociate_terms(term_a, term_b):
-        a, b = normalize_term(term_a), normalize_term(term_b)
-        params = {**term_params("ta", a), **term_params("tb", b)}
-        set_a, set_b = TERM_SET.format(p="ta"), TERM_SET.format(p="tb")
-
-        a_minus_b = pack(a, b, run_query(set_a, set_b, params))
-        if not want_both():
-            return jsonify(a_minus_b)
-        b_minus_a = pack(b, a, run_query(set_b, set_a, params))
-        return jsonify({"a_minus_b": a_minus_b, "b_minus_a": b_minus_a})
-
-    # ---- dissociation: MNI coordinates ----
-    @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
-    def dissociate_locations(coords_a, coords_b):
-        xa, ya, za = parse_coords(coords_a)
-        xb, yb, zb = parse_coords(coords_b)
-        r = get_radius()
-        params = {"ax": xa, "ay": ya, "az": za,
-                  "bx": xb, "by": yb, "bz": zb, "radius": r}
-        set_a = LOC_SET.format(p="a", srid=SRID)
-        set_b = LOC_SET.format(p="b", srid=SRID)
-        la, lb = [xa, ya, za], [xb, yb, zb]
-
-        a_minus_b = pack(la, lb, run_query(set_a, set_b, params))
-        a_minus_b["radius_mm"] = r
-        if not want_both():
-            return jsonify(a_minus_b)
-        b_minus_a = pack(lb, la, run_query(set_b, set_a, params))
-        b_minus_a["radius_mm"] = r
-        return jsonify({"a_minus_b": a_minus_b, "b_minus_a": b_minus_a})
-
-    # ---- smoke test ----
-    @app.get("/test_db", endpoint="test_db")
-    def test_db():
-        eng = get_engine()
-        payload = {"ok": False, "dialect": eng.dialect.name}
+def _limit_offset() -> Tuple[Optional[int], int]:
+    """limit is only applied if explicitly provided; otherwise return all rows (no LIMIT)."""
+    raw = request.args.get("limit", None)
+    limit: Optional[int] = None
+    if raw is not None:
         try:
-            with eng.begin() as conn:
-                conn.execute(text("SET search_path TO ns, public;"))
-                payload["version"] = conn.exec_driver_sql("SELECT version()").scalar()
-                payload["coordinates_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.coordinates")).scalar()
-                payload["metadata_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
-                payload["annotations_terms_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
-                rows = conn.execute(text(
-                    "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
-                )).mappings().all()
-                payload["coordinates_sample"] = [dict(r) for r in rows]
-                rows = conn.execute(text(
-                    "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
-                )).mappings().all()
-                payload["annotations_terms_sample"] = [dict(r) for r in rows]
-            payload["ok"] = True
-            return jsonify(payload), 200
-        except Exception as e:
-            payload["error"] = str(e)
-            return jsonify(payload), 500
+            val = int(raw)
+            limit = max(1, min(val, 10000))
+        except Exception:
+            limit = None
+    try:
+        offset = int(request.args.get("offset", 0))
+        offset = max(0, offset)
+    except Exception:
+        offset = 0
+    return limit, offset
 
+def _make_limit_clause(limit: Optional[int], offset: int) -> Tuple[str, Dict[str, Any]]:
+    clause = ""
+    params: Dict[str, Any] = {}
+    if limit is not None:
+        clause = "LIMIT :limit"
+        params["limit"] = limit
+        if offset:
+            clause += " OFFSET :offset"
+            params["offset"] = offset
+    else:
+        if offset:
+            clause = "OFFSET :offset"
+            params["offset"] = offset
+    return clause, params
+
+def _simple_terms_expr_to_sql(expr: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Convert simplified boolean expression (bare terms + AND/OR/NOT/+parens) into a SQL snippet.
+    Prefix-aware: each term T expands to ((terms ? :tN) OR (terms ? :tpN))
+    Supports implicit AND: "A NOT B" => "A AND NOT B", "A (B OR C)" => "A AND (B OR C)"
+    """
+    tokens = re.findall(r"\(|\)|\"[^\"]+\"|'[^']+'|[^\s()]+", expr)
+    params: Dict[str, Any] = {}
+    parts: List[str] = []
+    term_index = 0
+
+    prev_kind = None  # None | 'term' | 'op' | '(' | ')'
+
+    def add_implicit_and_if_needed(next_kind: str):
+        nonlocal prev_kind
+        if prev_kind in ('term', ')') and next_kind in ('term', 'not', '('):
+            parts.append('AND')
+
+    for tok in tokens:
+        if tok in ("(", ")"):
+            if tok == "(":
+                add_implicit_and_if_needed('(')
+                parts.append("(")
+                prev_kind = "("
+            else:
+                parts.append(")")
+                prev_kind = ")"
+            continue
+
+        upper = tok.upper()
+        if upper in BOOL_WORDS:
+            if upper == "NOT":
+                add_implicit_and_if_needed('not')
+                parts.append("NOT")
+                prev_kind = 'op'
+            else:
+                parts.append(upper)
+                prev_kind = 'op'
+            continue
+
+        # term
+        add_implicit_and_if_needed('term')
+        if (tok.startswith("'") and tok.endswith("'")) or (tok.startswith('"') and tok.endswith('"')):
+            val = tok[1:-1]
+        else:
+            val = tok
+        k_raw = f"t{term_index}"
+        k_pref = f"tp{term_index}"
+        term_index += 1
+        params[k_raw] = val
+        params[k_pref] = PREFIX + val
+        parts.append(f"((terms ? :{k_raw}) OR (terms ? :{k_pref}))")
+        prev_kind = 'term'
+
+    return " ".join(parts), params
+
+def _build_terms_where_and_params(qs: str) -> Tuple[str, Dict[str, Any]]:
+    decoded = urllib.parse.unquote(qs).strip()
+    # Always parse user bare terms (no JSONB syntax from users per your spec)
+    return _simple_terms_expr_to_sql(decoded)
+
+
+# --- FTS NOT firewall helpers (Plan A) ---
+def _build_neg_tsquery(expr: str) -> str:
+    """
+    Build a Postgres tsquery string that represents everything the user negated
+    in `expr`. If there is no NOT, return empty string.
+    Features:
+      - implicit AND ("A NOT B" == "A AND NOT B")
+      - quoted tokens remain single lexemes (no phrase semantics)
+      - '*' suffix becomes ':*' for tsquery prefix search
+    """
+    if not expr or ("NOT" not in expr and "not" not in expr):
+        return ""
+
+    tokens = re.findall(r"\(|\)|\"[^\"]+\"|'[^']+'|[^\s()]+", expr)
+    norm = []
+    for t in tokens:
+        tu = t.upper()
+        norm.append(tu if tu in ("AND","OR","NOT","(",")") else t)
+
+    i = 0
+    negatives = []
+
+    def starts_term(tok):
+        return (tok is not None) and (tok not in (")","OR"))
+
+    def term_token(tok: str) -> str:
+        raw = tok
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            raw = raw[1:-1]
+        if raw.endswith("*"):
+            base = raw[:-1]
+            return f"{base}:*"
+        return raw
+
+    def parse_primary():
+        nonlocal i
+        tok = norm[i] if i < len(norm) else None
+        if tok is None:
+            raise ValueError("Unexpected end of input")
+        if tok == "(":
+            i += 1
+            inner = parse_or()
+            if i >= len(norm) or norm[i] != ")":
+                raise ValueError("Expected ')'")
+            i += 1
+            return f"({inner})"
+        if tok in ("AND","OR","NOT",")"):
+            raise ValueError(f"Unexpected token: {tok}")
+        i += 1
+        return term_token(tok)
+
+    def parse_unary():
+        nonlocal i, negatives
+        tok = norm[i] if i < len(norm) else None
+        if tok == "NOT":
+            i += 1
+            operand = parse_unary()
+            negatives.append(operand)
+            return operand
+        return parse_primary()
+
+    def parse_and():
+        left = parse_unary()
+        while True:
+            tok = norm[i] if i < len(norm) else None
+            if tok == "AND":
+                i += 1
+                right = parse_unary()
+                left = f"({left}) & ({right})"
+            elif starts_term(tok):
+                right = parse_unary()
+                left = f"({left}) & ({right})"
+            else:
+                break
+        return left
+
+    def parse_or():
+        left = parse_and()
+        while True:
+            tok = norm[i] if i < len(norm) else None
+            if tok == "OR":
+                i += 1
+                right = parse_and()
+                left = f"({left}) | ({right})"
+            else:
+                break
+        return left
+
+    try:
+        _ = parse_or()
+    except Exception:
+        negatives = []
+
+    negatives = [n for n in dict.fromkeys([n for n in negatives if n])]
+    if not negatives:
+        return ""
+    return " | ".join([f"({n})" if (" " in n or "&" in n or "|" in n) else n for n in negatives])
+def _points_from_query_string(qs: str) -> List[Tuple[float,float,float]]:
+    """
+    Parse query strings like: [30,-60,50] AND [40,-50,45]
+    Currently supports AND-combinations of points.
+    """
+    s = urllib.parse.unquote(qs).strip()
+    pts = re.findall(r"\[([^\]]+)\]", s)
+    coords: List[Tuple[float,float,float]] = []
+    for p in pts:
+        parts = [c.strip() for c in p.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Invalid coordinate triple: [{p}]")
+        try:
+            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+        except Exception:
+            raise ValueError(f"Coordinate elements must be numeric: [{p}]")
+        coords.append((x,y,z))
+    if not coords:
+        raise ValueError("No coordinates found. Use [x,y,z] AND/OR/NOT [x2,y2,z2] ...")
+    return coords
+
+def _parse_location_boolean_expr(qs: str):
+    """
+    Parse location boolean expression into (points, expr_sql). Supports AND/OR/NOT and parentheses,
+    with implicit AND (e.g., "[a] NOT [b]" => "[a] AND NOT [b]").
+    - points: list of (x,y,z) floats in encounter order (unique)
+    - expr_sql: SQL boolean expression using EXISTS over 'hits' and alias 's' for studies table.
+    """
+    s = urllib.parse.unquote(qs).strip()
+    token_re = re.compile(r"\[[^\]]+\]|\(|\)|\bAND\b|\bOR\b|\bNOT\b", re.IGNORECASE)
+    tokens = token_re.findall(s)
+    if not tokens:
+        pts = _points_from_query_string(qs)
+        idxs = list(range(1, len(pts)+1))
+        parts = [f"(EXISTS (SELECT 1 FROM hits h WHERE h.study_id = s.study_id AND h.idx = {i}))" for i in idxs]
+        return pts, " AND ".join(parts)
+
+    points: List[Tuple[float,float,float]] = []
+    point_to_idx: Dict[Tuple[float,float,float], int] = {}
+
+    def parse_point(tok: str) -> int:
+        inside = tok.strip()[1:-1]  # remove [ ]
+        parts = [c.strip() for c in inside.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Invalid coordinate triple: {tok}")
+        x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+        key = (x, y, z)
+        if key not in point_to_idx:
+            point_to_idx[key] = len(points) + 1
+            points.append(key)
+        return point_to_idx[key]
+
+    expr_parts: List[str] = []
+    prev_kind: Optional[str] = None  # 'point' | 'op' | '(' | ')'
+    for tok in tokens:
+        up = tok.upper()
+        if tok.startswith("["):
+            if prev_kind in ("point", ")"):
+                expr_parts.append("AND")
+            idx = parse_point(tok)
+            expr_parts.append(f"(EXISTS (SELECT 1 FROM hits h WHERE h.study_id = s.study_id AND h.idx = {idx}))")
+            prev_kind = "point"
+        elif up in ("AND", "OR"):
+            expr_parts.append(up)
+            prev_kind = "op"
+        elif up == "NOT":
+            if prev_kind in ("point", ")"):
+                expr_parts.append("AND")
+            expr_parts.append("NOT")
+            prev_kind = "op"
+        elif tok == "(":
+            if prev_kind in ("point", ")"):
+                expr_parts.append("AND")
+            expr_parts.append("(")
+            prev_kind = "("
+        elif tok == ")":
+            expr_parts.append(")")
+            prev_kind = ")"
+        else:
+            # ignore
+            pass
+
+    expr_sql = " ".join(expr_parts).strip()
+    if not expr_sql:
+        raise ValueError("Empty boolean expression after parsing.")
+
+    return points, expr_sql
+
+
+# ------------ Term matching via annotation tables -------------
+_TERM_TOK = re.compile(r'"[^"]+"|\'[^\']+\'|\(|\)|[^\s()]+')
+
+
+def _term_bool_sql(expr: str, schema: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Turn 'a AND NOT "b c" OR d' into a SQL boolean over alias s.study_id,
+    using the annotation tables (each term = set of studies annotated with it).
+    Implicit AND between adjacent operands; precedence NOT > AND > OR."""
+    toks = _TERM_TOK.findall(expr or "")
+    toks = [t.upper() if t.upper() in ("AND", "OR", "NOT") else t for t in toks]
+    # Group runs of bare words: `default mode` matches the phrase term
+    # "default mode" OR (default AND mode).
+    grouped: List[Any] = []
+    for t in toks:
+        bare = t not in ("AND", "OR", "NOT", "(", ")") and t[:1] not in "\"'"
+        if bare and grouped and isinstance(grouped[-1], list):
+            grouped[-1].append(t)
+        elif bare:
+            grouped.append([t])
+        else:
+            grouped.append(t)
+    toks = [g[0] if isinstance(g, list) and len(g) == 1 else (tuple(g) if isinstance(g, list) else g) for g in grouped]
+    params: Dict[str, Any] = {}
+    pos = 0
+
+    if schema.get("annotations_terms"):
+        tmpl = "s.study_id IN (SELECT study_id FROM ns.annotations_terms WHERE term IN (:{a}, :{b}))"
+    else:
+        tmpl = "s.study_id IN (SELECT study_id FROM ns.annotations_json WHERE (terms ? :{a}) OR (terms ? :{b}))"
+
+    def term_sql(tok: str) -> str:
+        val = tok[1:-1] if tok[:1] in "\"'" and tok[-1:] == tok[:1] and len(tok) > 1 else tok
+        val = " ".join(val.replace("_", " ").split()).lower()
+        n = len(params) // 2
+        params[f"t{n}"] = val
+        params[f"tp{n}"] = PREFIX + val
+        return tmpl.format(a=f"t{n}", b=f"tp{n}")
+
+    def peek():
+        return toks[pos] if pos < len(toks) else None
+
+    def primary():
+        nonlocal pos
+        tok = peek()
+        if tok is None:
+            raise ValueError("Unexpected end of query")
+        if tok == "(":
+            pos += 1
+            inner = parse_or()
+            if peek() == ")":
+                pos += 1
+            return f"({inner})"
+        if tok in ("AND", "OR", ")"):
+            raise ValueError(f"Unexpected '{tok}' in query")
+        pos += 1
+        if isinstance(tok, tuple):
+            phrase = term_sql(" ".join(tok))
+            each = " AND ".join(term_sql(w) for w in tok)
+            return f"({phrase} OR ({each}))"
+        return term_sql(tok)
+
+    def unary():
+        nonlocal pos
+        if peek() == "NOT":
+            pos += 1
+            return f"NOT ({unary()})"
+        return primary()
+
+    def parse_and():
+        nonlocal pos
+        left = unary()
+        while True:
+            tok = peek()
+            if tok == "AND":
+                pos += 1
+                left = f"{left} AND {unary()}"
+            elif tok is not None and tok not in ("OR", ")"):
+                left = f"{left} AND {unary()}"   # implicit AND
+            else:
+                return left
+
+    def parse_or():
+        nonlocal pos
+        left = parse_and()
+        while peek() == "OR":
+            pos += 1
+            left = f"({left}) OR ({parse_and()})"
+        return left
+
+    sql = parse_or()
+    return sql, params
+
+
+def _build_matched(conn, query_string: str, r: float) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Build 'WITH ..., matched AS (...)' for a mixed term/location query."""
+    terms_expr, loc_expr = _split_mixed_query(query_string)
+    if not (terms_expr or loc_expr):
+        raise ValueError("Query must include at least a term or a [x,y,z] coordinate.")
+    schema = get_schema(conn)
+    ctes: List[str] = []
+    params: Dict[str, Any] = {}
+
+    if terms_expr:
+        if schema["annotations_terms"] or schema["annotations_json"]:
+            bool_sql, tp = _term_bool_sql(terms_expr, schema)
+            ctes.append(f"""matched_terms AS (
+              SELECT s.study_id FROM (SELECT DISTINCT study_id FROM ns.metadata) s
+              WHERE {bool_sql}
+            )""")
+            params.update(tp)
+        else:
+            ts_full = _build_full_tsquery(terms_expr)
+            fts = "m.fts @@ to_tsquery('english', :full_tsquery) OR " if schema["fts"] else ""
+            ctes.append(f"""matched_terms AS (
+              SELECT m.study_id FROM ns.metadata m
+              WHERE ({fts}to_tsvector('english', COALESCE(m.title,'')) @@ to_tsquery('english', :full_tsquery))
+            )""")
+            params["full_tsquery"] = ts_full
+
+    if loc_expr:
+        points, loc_sql = _parse_location_boolean_expr(loc_expr)
+        srid = int(schema.get("srid") or 0)
+        pts_rows = "\nUNION ALL\n".join(
+            f"SELECT {i+1} AS idx, ST_SetSRID(ST_MakePoint({float(x)}, {float(y)}, {float(z)}), {srid}) AS geom"
+            for i, (x, y, z) in enumerate(points))
+        # ST_3DDWithin can use the spatial index (much faster than ST_3DDistance < r)
+        ctes.append(f"""pts AS ( {pts_rows} ),
+            hits AS (
+              SELECT c.study_id, p.idx
+              FROM ns.coordinates c
+              JOIN pts p ON ST_3DDWithin(c.geom, p.geom, :r)
+              GROUP BY c.study_id, p.idx
+            ),
+            studies AS ( SELECT DISTINCT study_id FROM ns.coordinates ),
+            matched_loc AS ( SELECT s.study_id FROM studies s WHERE {loc_sql} )""")
+        params["r"] = r
+
+    if loc_expr and terms_expr:
+        matched_select = "SELECT study_id FROM matched_loc INTERSECT SELECT study_id FROM matched_terms"
+    elif loc_expr:
+        matched_select = "SELECT study_id FROM matched_loc"
+    else:
+        matched_select = "SELECT study_id FROM matched_terms"
+
+    with_sql = "WITH " + ",\n".join(ctes) + f",\nmatched AS ( {matched_select} )"
+    applied = {"terms": terms_expr, "locations": loc_expr, "r": r if loc_expr else None}
+    return with_sql, params, applied
+
+# ------------ Blueprint with the endpoints -------------
+
+
+def _parse_env_template_grid():
+    """Return (shape, affine, zooms, qform_code, sform_code) from env if provided,
+    otherwise use FSL MNI152 2mm defaults. Accepted env vars:
+      - MNI_SHAPE: '91,109,91'
+      - MNI_SROW_X: 'a11,a12,a13,a14'  (same for MNI_SROW_Y, MNI_SROW_Z)
+        OR MNI_AFFINE: 'a11,a12,...,a34' 12 comma-separated numbers row-major 3x4
+      - MNI_ZOOMS: '2,2,2'
+      - MNI_QFORM_CODE / MNI_SFORM_CODE: integers (e.g., 4)
+    """
+    import os, numpy as np
+    # Defaults (FSL MNI152 2mm)
+    shape = (91, 109, 91)
+    affine = np.array([
+        [-2.0,  0.0,  0.0,  90.0],
+        [ 0.0,  2.0,  0.0, -126.0],
+        [ 0.0,  0.0,  2.0, -72.0],
+        [ 0.0,  0.0,  0.0,   1.0],
+    ], dtype=float)
+    zooms = (2.0, 2.0, 2.0)
+    qform_code = 4
+    sform_code = 4
+
+    def _parse_tuple(s):
+        return tuple(float(x.strip()) for x in s.split(',') if x.strip())
+
+    shp = os.environ.get('MNI_SHAPE')
+    if shp:
+        parts = [int(float(x.strip())) for x in shp.split(',') if x.strip()]
+        if len(parts) == 3:
+            shape = tuple(parts)
+
+    if os.environ.get('MNI_AFFINE'):
+        vals = _parse_tuple(os.environ['MNI_AFFINE'])
+        if len(vals) == 12:
+            affine = np.array([vals[0:4], vals[4:8], vals[8:12], [0,0,0,1.0]], dtype=float)
+    else:
+        sx = os.environ.get('MNI_SROW_X')
+        sy = os.environ.get('MNI_SROW_Y')
+        sz = os.environ.get('MNI_SROW_Z')
+        if sx and sy and sz:
+            ax = _parse_tuple(sx); ay = _parse_tuple(sy); az = _parse_tuple(sz)
+            if len(ax) == 4 and len(ay) == 4 and len(az) == 4:
+                affine = np.array([ax, ay, az, [0,0,0,1.0]], dtype=float)
+
+    z = os.environ.get('MNI_ZOOMS')
+    if z:
+        vals = _parse_tuple(z)
+        if len(vals) == 3:
+            zooms = tuple(vals)
+
+    try:
+        qform_code = int(os.environ.get('MNI_QFORM_CODE', qform_code))
+    except Exception:
+        pass
+    try:
+        sform_code = int(os.environ.get('MNI_SFORM_CODE', sform_code))
+    except Exception:
+        pass
+
+    return shape, affine, zooms, qform_code, sform_code
+
+bp = Blueprint("dissociate_api", __name__)
+
+@bp.get("/debug/nii_meta")
+def debug_nii_meta():
+    shape, aff, zooms, qcode, scode = _parse_env_template_grid()
+    return jsonify({
+        "shape": shape,
+        "zooms": zooms,
+        "qform_code": qcode,
+        "sform_code": scode,
+        "affine": [[float(x) for x in aff[i,:]] for i in range(4)]
+    }), 200
+
+_TERMS_CACHE: Dict[str, Any] = {"t": 0, "terms": None}
+
+
+def _strip_prefix(t: str) -> str:
+    return t[len(PREFIX):] if t and t.startswith(PREFIX) else t
+
+
+@bp.get("/terms")
+@bp.get("/terms/<term>")
+def terms(term: str = None):
+    """
+    - GET /terms          -> all terms (prefix 'terms_abstract_tfidf__' stripped), cached 1 h
+    - GET /terms/<term>   -> related terms ranked by co-occurrence Jaccard index
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("SET search_path TO ns, public;"))
+        schema = get_schema(conn)
+        if not term:
+            if _TERMS_CACHE["terms"] is not None and time.time() - _TERMS_CACHE["t"] < 3600:
+                return jsonify({"terms": _TERMS_CACHE["terms"]}), 200
+            if schema["annotations_terms"]:
+                rows = conn.execute(text("SELECT DISTINCT term FROM ns.annotations_terms")).fetchall()
+            elif schema["annotations_json"]:
+                rows = conn.execute(text(
+                    "SELECT DISTINCT jsonb_object_keys(terms) AS term FROM ns.annotations_json")).fetchall()
+            else:
+                return jsonify({"error": "No term table (annotations_terms / annotations_json) found."}), 500
+            out = sorted({_strip_prefix(r[0]) for r in rows if r[0]})
+            out = [t for t in out if not re.match(r'^\d', t)]
+            _TERMS_CACHE.update(t=time.time(), terms=out)
+            return jsonify({"terms": out}), 200
+
+        term = " ".join(term.replace("_", " ").split()).lower()
+        limit, offset = _limit_offset()
+        if limit is None:
+            limit = 50
+        params = {"t": term, "tp": PREFIX + term, "limit": limit, "offset": offset}
+        if schema["annotations_terms"]:
+            sql = text("""
+                WITH a AS (
+                  SELECT DISTINCT study_id FROM ns.annotations_terms WHERE term IN (:t, :tp)
+                ),
+                co AS (
+                  SELECT at.term, COUNT(DISTINCT at.study_id) AS co_count
+                  FROM ns.annotations_terms at
+                  WHERE at.study_id IN (SELECT study_id FROM a) AND at.term NOT IN (:t, :tp)
+                  GROUP BY at.term
+                  ORDER BY co_count DESC
+                  LIMIT 400
+                ),
+                b AS (
+                  SELECT term, COUNT(DISTINCT study_id) AS n
+                  FROM ns.annotations_terms WHERE term IN (SELECT term FROM co) GROUP BY term
+                ),
+                a_cnt AS (SELECT COUNT(*) AS n FROM a)
+                SELECT co.term, co.co_count,
+                       co.co_count::float / NULLIF(a_cnt.n + b.n - co.co_count, 0) AS jaccard
+                FROM co JOIN b USING (term) CROSS JOIN a_cnt
+                ORDER BY jaccard DESC NULLS LAST, co_count DESC, term
+                LIMIT :limit OFFSET :offset
+            """)
+        else:
+            sql = text("""
+                WITH a AS (
+                  SELECT DISTINCT study_id FROM ns.annotations_json WHERE (terms ? :t) OR (terms ? :tp)
+                ),
+                co AS (
+                  SELECT k.term, COUNT(DISTINCT aj.study_id) AS co_count
+                  FROM ns.annotations_json aj
+                  JOIN LATERAL jsonb_object_keys(aj.terms) AS k(term) ON TRUE
+                  WHERE aj.study_id IN (SELECT study_id FROM a) AND k.term NOT IN (:t, :tp)
+                  GROUP BY k.term ORDER BY co_count DESC LIMIT 400
+                ),
+                b AS (
+                  SELECT k.term, COUNT(DISTINCT aj.study_id) AS n
+                  FROM ns.annotations_json aj
+                  JOIN LATERAL jsonb_object_keys(aj.terms) AS k(term) ON TRUE
+                  WHERE k.term IN (SELECT term FROM co) GROUP BY k.term
+                ),
+                a_cnt AS (SELECT COUNT(*) AS n FROM a)
+                SELECT co.term, co.co_count,
+                       co.co_count::float / NULLIF(a_cnt.n + b.n - co.co_count, 0) AS jaccard
+                FROM co JOIN b USING (term) CROSS JOIN a_cnt
+                ORDER BY jaccard DESC NULLS LAST, co_count DESC, term
+                LIMIT :limit OFFSET :offset
+            """)
+        rows = conn.execute(sql, params).mappings().all()
+        rel = []
+        for r_ in rows:
+            d = dict(r_)
+            d["term"] = _strip_prefix(d.get("term") or "")
+            if d["term"] and not re.match(r'^\d', d["term"]):
+                rel.append(d)
+        return jsonify({"term": term, "related": rel}), 200
+
+
+def _err(e: Exception, code: int = 400):
+    return jsonify({"error": str(e)}), code
+
+
+@bp.get("/query/<path:query_string>/studies")
+def mixed_query_studies(query_string: str):
+    r = request.args.get("r", default=6.0, type=float)
+    limit, offset = _limit_offset()
+    limit_clause, lp = _make_limit_clause(limit, offset)
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("SET search_path TO ns, public;"))
+        try:
+            with_sql, params, applied = _build_matched(conn, query_string, r)
+        except ValueError as e:
+            return _err(e)
+        schema = get_schema(conn)
+        cols = [c for c in ("study_id", "title", "authors", "journal", "year", "doi") if c in schema["meta_cols"]]
+        col_sql = ", ".join(f"m.{c}" for c in cols)
+        # DISTINCT ON: some databases keep several metadata rows per study
+        sql = text(f"""
+            {with_sql}
+            SELECT DISTINCT ON (m.study_id) {col_sql}
+            FROM ns.metadata m
+            JOIN matched x USING (study_id)
+            ORDER BY m.study_id
+            {limit_clause}
+        """)
+        rows = conn.execute(sql, {**params, **lp}).mappings().all()
+        out = [dict(r_) for r_ in rows]
+        return jsonify({"count": len(out), "applied": applied, "results": out}), 200
+
+
+@bp.get("/query/<path:query_string>/locations")
+def mixed_query_locations(query_string: str):
+    r = request.args.get("r", default=6.0, type=float)
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("SET search_path TO ns, public;"))
+        try:
+            coords_by_study = _collect_coords_for_mixed(conn, query_string, r=r)
+        except ValueError as e:
+            return _err(e)
+        limit, offset = _limit_offset()
+        rows = []
+        for sid, coords in coords_by_study.items():
+            for (x, y, z) in coords:
+                rows.append({"study_id": sid, "x": x, "y": y, "z": z})
+        rows.sort(key=lambda d: (d["study_id"], d["x"], d["y"], d["z"]))
+        if offset: rows = rows[offset:]
+        if limit is not None: rows = rows[:limit]
+        return jsonify({"location_counts": len(rows), "study_counts": len({d['study_id'] for d in rows}), "results": rows}), 200
+
+
+# --- Create a NIfTI map from coordinate dict {study_id: [(x,y,z), ...]} ---
+def _make_nii_from_coords(coords_by_study, voxel: float = 2.0, fwhm: float = 10.0, kernel: str = "gauss"):
+    """Meta-analytic map generator with a SINGLE canonical default header embedded from anatomical.nii.gz.
+    At runtime no files are read; both qform and sform are set identically to this default.
+    """
+    import os, tempfile, numpy as np
+    try:
+        import nibabel as nib
+    except Exception as e:
+        raise RuntimeError("nibabel is required to build NIfTI: " + str(e))
+    try:
+        from scipy.ndimage import gaussian_filter
+        has_scipy = True
+    except Exception:
+        has_scipy = False
+
+    shape = (91, 109, 91)
+    zooms = (2, 2, 2)
+    template_aff = np.array([
+        [-2, 0, 0, 90],
+        [0, 2, 0, -126],
+        [0, 0, 2, -72],
+        [0.0, 0.0, 0.0, 1.0]
+    ], dtype=float)
+
+    vol = np.zeros(shape, dtype=np.float32)
+    inv_aff = np.linalg.inv(template_aff)
+
+    n = 0
+    for sid, pts in coords_by_study.items():
+        for (x, y, z) in pts:
+            ijk_h = inv_aff @ np.array([float(x), float(y), float(z), 1.0], dtype=np.float64)
+            i, j, k = np.round(ijk_h[:3]).astype(int)
+            if 0 <= i < shape[0] and 0 <= j < shape[1] and 0 <= k < shape[2]:
+                vol[i, j, k] += 1.0
+                n += 1
+
+    if has_scipy and kernel.lower() == "gauss" and fwhm and fwhm > 0:
+        denom = 2.0 * np.sqrt(2.0 * np.log(2.0))
+        sigma_vox = tuple((fwhm / denom) / max(1e-6, z) for z in zooms)
+        vol = gaussian_filter(vol, sigma=sigma_vox, mode="constant", truncate=3.0)
+
+    out_img = nib.Nifti1Image(vol, template_aff)
+    out_img.set_data_dtype(np.float32)
+    hdr = out_img.header
+    hdr.set_data_shape(shape)
+    hdr.set_xyzt_units('mm', 'sec')
+    hdr.set_zooms(zooms)
+
+    # Enforce identical qform/sform and write srow_* explicitly for total consistency
+    out_img.set_sform(template_aff, code=4)
+    out_img.set_qform(template_aff, code=4)
+    hdr['srow_x'] = template_aff[0]
+    hdr['srow_y'] = template_aff[1]
+    hdr['srow_z'] = template_aff[2]
+
+    outdir = tempfile.mkdtemp(prefix="lotus_nii_")
+    outpath = os.path.join(outdir, "query_mixed_map.nii.gz")
+    nib.save(out_img, outpath)
+    return outpath, n
+
+
+@bp.get("/query/<path:query_string>/nii")
+def mixed_query_nii(query_string: str):
+    voxel  = request.args.get("voxel", default=2.0, type=float)
+    fwhm   = request.args.get("fwhm",  default=10.0, type=float)
+    kernel = request.args.get("kernel", default="gauss", type=str).lower()
+    r      = request.args.get("r",      default=6.0,  type=float)
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("SET search_path TO ns, public;"))
+        try:
+            coords_by_study = _collect_coords_for_mixed(conn, query_string, r=r)
+            path, n = _make_nii_from_coords(coords_by_study, voxel=voxel, fwhm=fwhm, kernel=kernel)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+    filename = "query_mixed_map.nii.gz"
+    return send_file(path, as_attachment=True, download_name=filename, mimetype="application/octet-stream")
+
+def _split_mixed_query(qs: str):
+    s = urllib.parse.unquote(qs).strip()
+    token_re = re.compile(r"""\[[^\]]+\]|"([^"\\]|\\.)+"|'([^'\\]|\\.)+'|\bAND\b|\bOR\b|\bNOT\b|\(|\)|[^()\s]+""", re.IGNORECASE)
+    toks = [m.group(0) for m in re.finditer(token_re, s)]
+    # -------- build location expr (only [], (), AND/OR/NOT considered) --------
+    loc_parts = []
+    prev_was_operand = False  # operand = [...] or ')'
+    N = len(toks)
+    def _next_is_loc_operand(j):
+        k = j
+        while k < N:
+            t = toks[k]
+            up = t.upper()
+            if t.startswith('[') and t.endswith(']'):
+                return True
+            if up in ('(',')'):
+                return up == '('
+            if up in ('AND','OR'):
+                return False
+            if up == 'NOT':
+                k += 1
+                if k < N and (toks[k].startswith('[') and toks[k].endswith(']') or toks[k].upper()=='('):
+                    return True
+                return False
+            return False   # a term token: the operator belongs to the terms side
+        return False
+
+    i = 0
+    while i < N:
+        t = toks[i]
+        up = t.upper()
+        if t.startswith('[') and t.endswith(']'):
+            loc_parts.append(t)
+            prev_was_operand = True
+        elif up in ('(',')'):
+            loc_parts.append(up)
+            prev_was_operand = (up == ')')
+        elif up in ('AND','OR'):
+            if prev_was_operand and _next_is_loc_operand(i+1):
+                loc_parts.append(up)
+                prev_was_operand = False
+        elif up == 'NOT':
+            if _next_is_loc_operand(i+1):
+                if prev_was_operand and (not loc_parts or loc_parts[-1] != 'AND'):
+                    loc_parts.append('AND')
+                loc_parts.append('NOT')
+                prev_was_operand = False
+        i += 1
+    loc_expr = " ".join(loc_parts).strip() or None
+
+    # -------- build terms expr --------
+    # Keep every non-location token (incl. parentheses and OR), drop the
+    # location operands and a NOT that negates them, then tidy dangling operators.
+    out = []
+    for t in toks:
+        up = t.upper()
+        if t.startswith('[') and t.endswith(']'):
+            if out and out[-1] == 'NOT':
+                out.pop()
+            continue
+        out.append(up if up in ('AND', 'OR', 'NOT') else t)
+
+    def _is_operand_end(x):
+        return x is not None and x not in ('AND', 'OR', 'NOT', '(')
+
+    changed = True
+    while changed:
+        changed = False
+        for j in range(len(out)):
+            cur = out[j]
+            prev = out[j - 1] if j > 0 else None
+            nxt = out[j + 1] if j + 1 < len(out) else None
+            drop = False
+            if cur in ('AND', 'OR'):
+                drop = not _is_operand_end(prev) or nxt in (None, ')', 'AND', 'OR')
+            elif cur == 'NOT':
+                drop = nxt in (None, ')', 'AND', 'OR')
+            elif cur == '(' and nxt == ')':
+                del out[j:j + 2]; changed = True; break
+            if drop:
+                del out[j]; changed = True; break
+    # unbalanced parentheses would break the parser: drop them all in that case
+    if out.count('(') != out.count(')'):
+        out = [x for x in out if x not in ('(', ')')]
+    terms_expr = " ".join(out).strip() or None
+
+    def _empty(expr: str) -> bool:
+        s = expr.replace('(', '').replace(')', '').replace('AND','').replace('OR','').replace('NOT','').strip()
+        return s == ''
+    if terms_expr is not None and _empty(terms_expr): terms_expr=None
+    if loc_expr is not None and _empty(loc_expr): loc_expr=None
+    return terms_expr, loc_expr
+
+def _collect_coords_for_mixed(conn, query_string: str, r: float):
+    with_sql, params, _ = _build_matched(conn, query_string, r)
+    sql = text(f"""
+        {with_sql}
+        SELECT c.study_id,
+               ST_X(c.geom)::float AS x,
+               ST_Y(c.geom)::float AS y,
+               ST_Z(c.geom)::float AS z
+        FROM ns.coordinates c
+        JOIN matched x USING (study_id)
+    """)
+    rows = conn.execute(sql, params).mappings().all()
+    out = {}
+    for r_ in rows:
+        out.setdefault(r_["study_id"], []).append((r_["x"], r_["y"], r_["z"]))
+    return out
+
+DIST_DIR = os.path.abspath(os.getenv("LOTUS_DIST", os.path.join(os.path.dirname(__file__), "dist")))
+fe = Blueprint("lotus_frontend", __name__)
+
+
+@fe.get("/lotus-bf")
+def _fe_redirect():
+    from flask import redirect
+    return redirect("/lotus-bf/", code=301)
+
+
+@fe.get("/lotus-bf/")
+@fe.get("/lotus-bf/<path:path>")
+def _fe(path: str = ""):
+    """Serve the built React app (npm run build -> dist/) under /lotus-bf/."""
+    if not os.path.isdir(DIST_DIR):
+        abort(404, description="Frontend not built: run `npm run build` (creates ./dist).")
+    if path and os.path.isfile(os.path.join(DIST_DIR, path)):
+        resp = send_from_directory(DIST_DIR, path)
+        if path.startswith("assets/"):
+            resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+    return send_from_directory(DIST_DIR, "index.html")   # SPA fallback
+
+
+def _add_cors(resp):
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    return resp
+
+
+def register_lotus(app: Flask) -> Flask:
+    """Attach LoTUS-BF API + frontend to an existing Flask app."""
+    app.register_blueprint(bp)
+    app.register_blueprint(fe)
+    app.after_request(_add_cors)
     return app
 
 
-# WSGI entry point: gunicorn app:app --bind 0.0.0.0:$PORT
+def create_app():
+    """Build the WSGI app.
+    If last week's ns-nano dissociation API (ns_dissociate.py) is next to this file,
+    LoTUS-BF is mounted onto it so both APIs share one URL; otherwise LoTUS-BF runs alone.
+    Local dev:  flask --app app:create_app run --port 5000
+    """
+    try:
+        from ns_dissociate import create_app as _create_dissociate_app
+        base = _create_dissociate_app()
+    except ImportError:
+        base = Flask(__name__)
+    return register_lotus(base)
+
+
+def _lotus_help_payload():
+    return {
+        "service": {"name": "LoTUS-BF", "tagline": "Location-or-Term Unified Search for Brain Functions"},
+        "ok": True,
+        "endpoints": [
+            "/terms",
+            "/terms/<term>",
+            "/query/<query_string>/studies",
+            "/query/<query_string>/locations",
+            "/query/<query_string>/nii"
+        ],
+        "notes": "Use /query/<mixed>/(studies|locations|nii). 'mixed' supports coordinates like [x,y,z] and boolean terms with AND/OR/NOT.",
+        "docs": {
+            "syntax": {
+                "mixed_query": "/query/<mixed_query>/(studies|locations|nii)",
+                "operators": ["AND","OR","NOT","(",")"],
+                "locations": "[x,y,z] with optional ?r=float (default 6.0)",
+                "terms": "bare words auto-grouped into phrases; or use quotes for exact phrases"
+            },
+            "params": {
+                "r": "sphere radius around [x,y,z] (default 6.0)",
+                "voxel": "voxel size for NIfTI (default 2.0)",
+                "fwhm": "smoothing FWHM (default 10.0)",
+                "kernel": "gauss | uniform (default gauss)",
+                "limit_offset": "limit, offset for pagination on studies/locations"
+            },
+            "examples": [
+                "/query/[-2,50,-6] NOT \"ventromedial prefrontal\"/studies",
+                "/query/([30,-60,50] OR [40,-50,45]) AND default mode/locations?r=8",
+                "/query/[-2,50,-6] AND reward/nii?voxel=2&fwhm=8&kernel=gauss"
+            ]
+        }
+    }
+
+@bp.get("/lotus-api")
+def index():
+    return "LoTUS-BF API working! See /help"
+
+@bp.get("/help")
+def help():
+    return jsonify(_lotus_help_payload())
+
+
+_TOKEN_AND="AND";_TOKEN_OR="OR";_TOKEN_NOT="NOT"
+_TOKEN_RE=re.compile(r'\s*(\(|\)|"(?:\\.|[^"\\])*"|\bAND\b|\bOR\b|\bNOT\b|[^\s()]+)',re.IGNORECASE)
+def _build_full_tsquery(expr:str)->str:
+    expr=_normalize_query(expr)
+    if not expr: return ""
+    toks=[m.group(1) for m in _TOKEN_RE.finditer(expr)]
+    toks=[t if t in("(",")") else (t.upper() if t.upper() in(_TOKEN_AND,_TOKEN_OR,_TOKEN_NOT) else t) for t in toks]
+    i=0
+    def starts_term(tok): return tok is not None and tok not in(")",_TOKEN_OR)
+    def term_tok(tok:str)->str:
+        raw = tok
+        quoted = False
+        if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+            quoted = True
+            raw = raw[1:-1]
+        parts = raw.split()
+        def norm(p: str) -> str:
+            return (p[:-1] + ":*") if p.endswith("*") else p
+        if quoted and len(parts) > 1:
+            # Phrase query -> adjacent terms
+            return "(" + " <-> ".join(norm(p) for p in parts) + ")"
+        if len(parts) > 1:
+            # Safety: multiple terms without quotes -> AND them
+            return "(" + " & ".join(norm(p) for p in parts) + ")"
+        return norm(parts[0]) if parts else ""
+    def parse_primary():
+        nonlocal i
+        tok=toks[i] if i<len(toks) else None
+        if tok is None: raise ValueError("Unexpected end of input")
+        if tok=="(":
+            i+=1
+            inner=parse_or()
+            if i>=len(toks) or toks[i]!=")": raise ValueError("Expected ')'")
+            i+=1
+            return f"({inner})"
+        if tok in(_TOKEN_AND,_TOKEN_OR,_TOKEN_NOT,")"): raise ValueError(f"Unexpected token: {tok}")
+        i+=1
+        return term_tok(tok)
+    def parse_unary():
+        nonlocal i
+        tok=toks[i] if i<len(toks) else None
+        if tok==_TOKEN_NOT:
+            i+=1
+            op=parse_unary()
+            return f"!({op})"
+        return parse_primary()
+    def parse_and():
+        nonlocal i
+        left=parse_unary()
+        while True:
+            tok=toks[i] if i<len(toks) else None
+            if tok==_TOKEN_AND:
+                i+=1
+                right=parse_unary()
+                left=f"({left}) & ({right})"
+            elif starts_term(tok):
+                right=parse_unary()
+                left=f"({left}) & ({right})"
+            else: break
+        return left
+    def parse_or():
+        nonlocal i
+        left=parse_and()
+        while True:
+            tok=toks[i] if i<len(toks) else None
+            if tok==_TOKEN_OR:
+                i+=1
+                right=parse_and()
+                left=f"({left}) | ({right})"
+            else: break
+        return left
+    return parse_or()
+
+
+# WSGI entry point (Render start command: gunicorn app:app)
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.getenv("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
