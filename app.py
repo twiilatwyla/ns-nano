@@ -599,6 +599,16 @@ def debug_nii_meta():
     }), 200
 
 _TERMS_CACHE: Dict[str, Any] = {"t": 0, "terms": None}
+_DF_CACHE: Dict[str, int] = {}
+
+
+def _term_doc_freq(conn) -> Dict[str, int]:
+    """Number of studies annotated with each term (cached for the process lifetime)."""
+    if not _DF_CACHE:
+        rows = conn.execute(text(
+            "SELECT term, COUNT(DISTINCT study_id) FROM ns.annotations_terms GROUP BY term")).fetchall()
+        _DF_CACHE.update({t: int(n) for t, n in rows})
+    return _DF_CACHE
 
 
 def _strip_prefix(t: str) -> str:
@@ -637,29 +647,27 @@ def terms(term: str = None):
             limit = 50
         params = {"t": term, "tp": PREFIX + term, "limit": limit, "offset": offset}
         if schema["annotations_terms"]:
-            sql = text("""
-                WITH a AS (
-                  SELECT DISTINCT study_id FROM ns.annotations_terms WHERE term IN (:t, :tp)
-                ),
-                co AS (
-                  SELECT at.term, COUNT(DISTINCT at.study_id) AS co_count
-                  FROM ns.annotations_terms at
-                  WHERE at.study_id IN (SELECT study_id FROM a) AND at.term NOT IN (:t, :tp)
-                  GROUP BY at.term
-                  ORDER BY co_count DESC
-                  LIMIT 400
-                ),
-                b AS (
-                  SELECT term, COUNT(DISTINCT study_id) AS n
-                  FROM ns.annotations_terms WHERE term IN (SELECT term FROM co) GROUP BY term
-                ),
-                a_cnt AS (SELECT COUNT(*) AS n FROM a)
-                SELECT co.term, co.co_count,
-                       co.co_count::float / NULLIF(a_cnt.n + b.n - co.co_count, 0) AS jaccard
-                FROM co JOIN b USING (term) CROSS JOIN a_cnt
-                ORDER BY jaccard DESC NULLS LAST, co_count DESC, term
-                LIMIT :limit OFFSET :offset
-            """)
+            # Fast path: document frequency of every term is computed once and cached,
+            # so each request only needs the co-occurrence counts.
+            df = _term_doc_freq(conn)
+            n_a = conn.execute(text(
+                "SELECT COUNT(DISTINCT study_id) FROM ns.annotations_terms WHERE term IN (:t, :tp)"),
+                params).scalar() or 0
+            rows = conn.execute(text("""
+                SELECT at.term, COUNT(DISTINCT at.study_id) AS co_count
+                FROM ns.annotations_terms at
+                WHERE at.study_id IN (SELECT study_id FROM ns.annotations_terms WHERE term IN (:t, :tp))
+                  AND at.term NOT IN (:t, :tp)
+                GROUP BY at.term
+            """), params).fetchall()
+            rel = []
+            for t_, co in rows:
+                denom = n_a + df.get(t_, co) - co
+                name = _strip_prefix(t_ or "")
+                if name and not re.match(r'^\d', name):
+                    rel.append({"term": name, "co_count": int(co), "jaccard": (co / denom) if denom else None})
+            rel.sort(key=lambda d: (-(d["jaccard"] or 0), -d["co_count"], d["term"]))
+            return jsonify({"term": term, "related": rel[offset:offset + limit]}), 200
         else:
             sql = text("""
                 WITH a AS (
